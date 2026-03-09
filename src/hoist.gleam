@@ -1,12 +1,16 @@
 import gleam/dict
 import gleam/list
+import gleam/regexp
 import gleam/result
 import gleam/set
 import gleam/string
 
 pub type ParseError {
+  /// A flag was encountered that was not defined upfront.
   UnknownFlag(String)
+  /// A value was not defined for a value-type flag.
   ValueNotProvided(flag: String)
+  /// A value was passed to a count-kind or toggle-kind flag.
   ValueNotSupported(flag: String, given: String)
 }
 
@@ -18,9 +22,9 @@ fn replace_error_flag_name(error: ParseError, flag_name: String) {
   }
 }
 
-/// Whether a flag takes a value or is a boolean toggle
+/// A type defining the behaviour of a flag.
 type FlagKind {
-  /// Flag takes a value (Int, Float, String, list variants)
+  /// Flag takes a value
   ValueKind
   /// Flag is a boolean toggle
   ToggleKind
@@ -28,6 +32,7 @@ type FlagKind {
   CountKind
 }
 
+/// A specification for a flag in Hoist.
 pub opaque type FlagSpec {
   FlagSpec(
     name: String,
@@ -37,107 +42,205 @@ pub opaque type FlagSpec {
   )
 }
 
-type FlagSpecs {
-  FlagSpecs(
+/// A collection of validated flag specs.
+pub opaque type ValidatedFlagSpecs {
+  ValidatedFlagSpecs(
     long_flags: dict.Dict(String, FlagSpec),
     short_flags: dict.Dict(String, FlagSpec),
   )
 }
 
+/// Creates a new flag with the given long name, e.g. `--name`. Case sensitive.
 pub fn new_flag(name: String) -> FlagSpec {
   FlagSpec(name:, aliases: set.new(), short: set.new(), kind: ValueKind)
 }
 
+/// Adds a long alias for a command, e.g. `--name, --first-name`.
+///
+/// A flag can have multiple long aliases. These are stored in a
+/// set and will be deduplicated. Case sensitive.
 pub fn with_long_alias(flag: FlagSpec, alias: String) -> FlagSpec {
   FlagSpec(..flag, aliases: set.insert(flag.aliases, alias))
 }
 
+/// Adds a short alias for a command, e.g. `--name, -n`.
+///
+/// A flag can have multiple short aliases. These are stored in a
+/// set and will be deduplicated. Case sensitive.
 pub fn with_short_alias(flag: FlagSpec, short: String) -> FlagSpec {
   FlagSpec(..flag, short: set.insert(flag.short, short))
 }
 
+/// Designates this flag as a toggle-kind flag. Generally used to enable
+/// or disable an option, e.g. `--colour`, `--no-colour`. Does not
+/// receive a value.
 pub fn as_toggle(flag: FlagSpec) -> FlagSpec {
   FlagSpec(..flag, kind: ToggleKind)
 }
 
+/// Designates this flag as a count-kind flag. Often used for verbosity levels,
+/// e.g. `-vvv` would have a count of 3.
 pub fn as_count(flag: FlagSpec) -> FlagSpec {
   FlagSpec(..flag, kind: CountKind)
 }
 
-fn build_flag_specs(flags: List(FlagSpec)) -> FlagSpecs {
-  let #(long_flags, short_flags) =
-    list.fold(flags, #(dict.new(), dict.new()), fn(dicts, flag) {
-      let #(lf, stl) = dicts
-
-      let lf = dict.insert(lf, flag.name, flag)
-      let lf =
-        set.fold(flag.aliases, lf, fn(curr, alias) {
-          dict.insert(curr, alias, flag)
-        })
-
-      let stl =
-        set.fold(flag.short, stl, fn(curr, short) {
-          dict.insert(curr, short, flag)
-        })
-
-      #(lf, stl)
-    })
-
-  FlagSpecs(long_flags:, short_flags:)
+/// Errors that occur when building flags
+pub type FlagSpecValidationError {
+  EmptyName(FlagSpec)
+  InvalidNameOrAlias(name: String, flag_spec: FlagSpec)
+  InvalidShortAlias(short: String, flag_spec: FlagSpec)
 }
 
+fn flag_name_validation_regex() -> regexp.Regexp {
+  let assert Ok(pattern) =
+    regexp.compile(
+      "^[a-zA-Z0-9][a-zA-Z0-9_-]*$",
+      regexp.Options(case_insensitive: False, multi_line: False),
+    )
+
+  pattern
+}
+
+fn validate_single_flag_spec(
+  flag_spec: FlagSpec,
+  validation_regex: regexp.Regexp,
+) -> Result(FlagSpec, FlagSpecValidationError) {
+  let all_long_names = [flag_spec.name, ..set.to_list(flag_spec.aliases)]
+
+  let long_name_validation_result =
+    list.try_each(all_long_names, fn(name) {
+      case name {
+        "" -> Error(EmptyName(flag_spec))
+        name -> {
+          case regexp.check(validation_regex, name) {
+            True -> Ok(Nil)
+            False -> Error(InvalidNameOrAlias(name, flag_spec))
+          }
+        }
+      }
+    })
+
+  use _ <- result.try(long_name_validation_result)
+
+  let short_name_validation_result =
+    list.try_each(set.to_list(flag_spec.short), fn(short) {
+      case string.length(short) {
+        0 -> Error(EmptyName(flag_spec))
+        1 -> {
+          case regexp.check(validation_regex, short) {
+            True -> Ok(Nil)
+            False -> Error(InvalidShortAlias(short, flag_spec))
+          }
+        }
+        _ -> Error(InvalidShortAlias(short, flag_spec))
+      }
+    })
+
+  use _ <- result.try(short_name_validation_result)
+
+  Ok(flag_spec)
+}
+
+/// Validates flag specs
+pub fn validate_flag_specs(
+  flags: List(FlagSpec),
+) -> Result(ValidatedFlagSpecs, List(FlagSpecValidationError)) {
+  let #(_, flag_validation_errors) =
+    list.map(flags, validate_single_flag_spec(_, flag_name_validation_regex()))
+    |> result.partition
+
+  case flag_validation_errors {
+    [] -> {
+      let #(long_flags, short_flags) =
+        list.fold(flags, #(dict.new(), dict.new()), fn(dicts, flag) {
+          let #(lf, stl) = dicts
+
+          let lf = dict.insert(lf, flag.name, flag)
+          let lf =
+            set.fold(flag.aliases, lf, fn(curr, alias) {
+              dict.insert(curr, alias, flag)
+            })
+
+          let stl =
+            set.fold(flag.short, stl, fn(curr, short) {
+              dict.insert(curr, short, flag)
+            })
+
+          #(lf, stl)
+        })
+
+      Ok(ValidatedFlagSpecs(long_flags:, short_flags:))
+    }
+
+    errors -> Error(errors)
+  }
+}
+
+/// A parsed flag.
 pub type Flag {
-  /// A flag with a value, e.g. from `--name=val` or `--name val` or `-n val`
+  /// A flag with a value, e.g. from `--name=val`, `--name val`, `-n val` or `-nval`.
   ValueFlag(name: String, value: String)
-  /// A flag toggle (bool), e.g. from `--verbose` or `-v`
+  /// A flag toggle (bool), e.g. from `--dry-run` or `-d`.
   ToggleFlag(name: String)
-  /// A flag count, e.g. from `-vvv`
+  /// A flag count, e.g. from `-vvv`.
   CountFlag(name: String, count: Int)
 }
 
-/// Result of parsing raw args
+/// The result of parsing CLI arguments.
 pub type Args {
   Args(
-    /// Positional arguments
+    /// Positional arguments.
     arguments: List(String),
-    /// Flag inputs normalised to "name=value" or "name" (toggle) form, prefix stripped
+    /// Parsed flags.
     flags: List(Flag),
   )
 }
 
-/// Intermediate representation of ParsedArgs that has positional arguments reversed.
-type ParseState {
-  ParseState(
-    /// Flag inputs normalised to "name=value" or "name" (toggle) form, prefix stripped
-    flags: List(Flag),
-    /// Positional arguments in reverse order
-    arguments_reversed: List(String),
-  )
-}
-
-/// Parse positional args and flags from a list of args.
+/// Parses positional args and flags from a list of args.
 ///
-/// Note: this function expects any whitespace-only args to have been filtered
-/// already, and does not handle them.
+/// Note: this function does not sanitise input in any way. If you require
+/// sanitisation, e.g. removal of whitespace-only arguments, you must handle
+/// that yourself.
 pub fn parse(
   input: List(String),
-  flags: List(FlagSpec),
+  flags: ValidatedFlagSpecs,
 ) -> Result(Args, ParseError) {
-  let state = ParseState(flags: [], arguments_reversed: [])
-  do_parse(input, build_flag_specs(flags), Ok(state))
-  |> result.map(fn(state) {
-    Args(
-      arguments: list.reverse(state.arguments_reversed),
-      flags: list.reverse(state.flags),
-    )
+  parse_with_hook(input, flags, Nil, fn(state, _, _, flags) {
+    Ok(#(state, flags))
   })
+}
+
+/// Similar to [`parse`](#parse) but allows passing a custom hook that gets called
+/// after a positional argument is parsed.
+///
+/// The hook accepts the current hook state, the most recent positional argument,
+/// the currently parsed arguments and flags, and the available flag specs.
+///
+/// The hook can return a new set of flags to be used for parsing the next argument,
+/// along with a new state value.
+///
+/// Useful when the flags available for parsing depend on the value of a previous
+/// positional argument.
+pub fn parse_with_hook(
+  input: List(String),
+  flags: ValidatedFlagSpecs,
+  hook_state: a,
+  // TODO: custom error type
+  parse_hook: fn(a, String, Args, ValidatedFlagSpecs) ->
+    Result(#(a, ValidatedFlagSpecs), Nil),
+) -> Result(Args, ParseError) {
+  let state = Args(flags: [], arguments: [])
+  do_parse(input, flags, Ok(state), hook_state, parse_hook)
 }
 
 fn do_parse(
   remaining_input: List(String),
-  flag_specs: FlagSpecs,
-  state: Result(ParseState, ParseError),
-) -> Result(ParseState, ParseError) {
+  flag_specs: ValidatedFlagSpecs,
+  state: Result(Args, ParseError),
+  hook_state: a,
+  parse_hook: fn(a, String, Args, ValidatedFlagSpecs) ->
+    Result(#(a, ValidatedFlagSpecs), Nil),
+) -> Result(Args, ParseError) {
   // TODO: refactor to not use result.try as this prevents tail recursion.
   // Might not be necessary given the length of most commands, but definitely
   // something to take into consideration.
@@ -148,57 +251,76 @@ fn do_parse(
 
     // Treat anything after bare `--` as positional args and end parsing here.
     ["--", ..rest] ->
-      Ok(
-        ParseState(
-          ..state,
-          arguments_reversed: list.append(
-            list.reverse(rest),
-            state.arguments_reversed,
-          ),
-        ),
-      )
+      Ok(Args(..state, arguments: list.append(state.arguments, rest)))
     // Treat `--` followed by a string as a flag. May have a value with
     // `=`, or may be a bare flag with the value in the next arg.
     ["--" <> flag_name, ..rest] ->
-      handle_long_flag(flag_name, rest, flag_specs, state)
+      handle_long_flag(
+        flag_name,
+        rest,
+        flag_specs,
+        state,
+        hook_state,
+        parse_hook,
+      )
 
     // Treat bare `-` as positional.
     ["-" as arg, ..rest] ->
-      do_parse(
-        rest,
-        flag_specs,
-        Ok(
-          ParseState(..state, arguments_reversed: [
-            arg,
-            ..state.arguments_reversed
-          ]),
-        ),
-      )
+      handle_positional(arg, rest, flag_specs, state, hook_state, parse_hook)
+
     // `-` followed by a value is one or more short flags.
     ["-" <> flag_names, ..rest] ->
-      handle_short_flag(flag_names, rest, flag_specs, state)
+      handle_short_flag(
+        flag_names,
+        rest,
+        flag_specs,
+        state,
+        hook_state,
+        parse_hook,
+      )
 
     // Anything else is positional
     [arg, ..rest] ->
-      do_parse(
-        rest,
-        flag_specs,
-        Ok(
-          ParseState(..state, arguments_reversed: [
-            arg,
-            ..state.arguments_reversed
-          ]),
-        ),
-      )
+      handle_positional(arg, rest, flag_specs, state, hook_state, parse_hook)
   }
+}
+
+fn handle_positional(
+  new_arg: String,
+  remaining_input: List(String),
+  flag_specs: ValidatedFlagSpecs,
+  state: Args,
+  hook_state: a,
+  parse_hook: fn(a, String, Args, ValidatedFlagSpecs) ->
+    Result(#(a, ValidatedFlagSpecs), Nil),
+) -> Result(Args, ParseError) {
+  // TODO
+  let new_args =
+    Args(..state, arguments: list.append(state.arguments, [new_arg]))
+
+  use #(new_hook_state, new_flag_specs) <- result.try(
+    parse_hook(hook_state, new_arg, new_args, flag_specs)
+    |> result.replace_error(UnknownFlag("")),
+  )
+
+  do_parse(
+    remaining_input,
+    new_flag_specs,
+    Ok(new_args),
+    new_hook_state,
+    parse_hook,
+  )
 }
 
 fn handle_long_flag(
   flag_name: String,
   remaining_input: List(String),
-  flag_specs: FlagSpecs,
-  state: ParseState,
-) -> Result(ParseState, ParseError) {
+  flag_specs: ValidatedFlagSpecs,
+  state: Args,
+  hook_state: a,
+  parse_hook: fn(a, String, Args, ValidatedFlagSpecs) ->
+    Result(#(a, ValidatedFlagSpecs), Nil),
+) -> Result(Args, ParseError) {
   // If the flag contains a `=` character, treat that as the value
   // and prepend it to the rest of the args to make processing easier
   // later (i.e. so we only have to process the case where the flag
@@ -221,14 +343,17 @@ fn handle_long_flag(
                 rest,
                 flag_specs,
                 Ok(
-                  ParseState(
+                  // We don't upsert here. Keep all value-kind flags
+                  // so we can support lists.
+                  Args(
                     ..state,
-                    flags: upsert_flag(
+                    flags: list.append(state.flags, [
                       ValueFlag(flag_spec.name, value),
-                      state.flags,
-                    ),
+                    ]),
                   ),
                 ),
+                hook_state,
+                parse_hook,
               )
             [] -> Error(ValueNotProvided(parsed_flag_name))
           }
@@ -254,7 +379,7 @@ fn handle_long_flag(
             remaining_input,
             flag_specs,
             Ok(
-              ParseState(
+              Args(
                 ..state,
                 flags: upsert_flag(
                   ToggleFlag(name: flag_spec.name),
@@ -262,18 +387,17 @@ fn handle_long_flag(
                 ),
               ),
             ),
+            hook_state,
+            parse_hook,
           )
 
         CountKind, False ->
           do_parse(
             remaining_input,
             flag_specs,
-            Ok(
-              ParseState(
-                ..state,
-                flags: upsert_count_flag(flag_spec, state.flags),
-              ),
-            ),
+            Ok(Args(..state, flags: upsert_count_flag(flag_spec, state.flags))),
+            hook_state,
+            parse_hook,
           )
       }
     }
@@ -283,13 +407,17 @@ fn handle_long_flag(
 fn handle_short_flag(
   flag_names: String,
   remaining_input: List(String),
-  flag_specs: FlagSpecs,
-  state: ParseState,
-) -> Result(ParseState, ParseError) {
+  flag_specs: ValidatedFlagSpecs,
+  state: Args,
+  hook_state: a,
+  parse_hook: fn(a, String, Args, ValidatedFlagSpecs) ->
+    Result(#(a, ValidatedFlagSpecs), Nil),
+) -> Result(Args, ParseError) {
   let graphemes = string.to_graphemes(flag_names)
 
   case graphemes {
-    [] -> do_parse(remaining_input, flag_specs, Ok(state))
+    [] ->
+      do_parse(remaining_input, flag_specs, Ok(state), hook_state, parse_hook)
 
     [short_flag, ..rest_flags] ->
       case dict.get(flag_specs.short_flags, short_flag) {
@@ -299,7 +427,14 @@ fn handle_short_flag(
             // For a length 1 list (e.g. `-x`), we can just look up the corresponding
             // long flag name and parse that.
             [] ->
-              handle_long_flag(flag.name, remaining_input, flag_specs, state)
+              handle_long_flag(
+                flag.name,
+                remaining_input,
+                flag_specs,
+                state,
+                hook_state,
+                parse_hook,
+              )
               |> result.map_error(replace_error_flag_name(_, short_flag))
 
             // If the rest of the graphemes follow `=`, we assume the current flag is
@@ -311,20 +446,22 @@ fn handle_short_flag(
               case flag.kind {
                 ToggleKind | CountKind ->
                   Error(ValueNotSupported(flag: short_flag, given: value))
-                // Continue with regular parsing loop
+                // Continue with regular parsing loop. We don't upsert value flags
+                // so they can be used for lists.
                 ValueKind ->
                   do_parse(
                     remaining_input,
                     flag_specs,
                     Ok(
-                      ParseState(
+                      Args(
                         ..state,
-                        flags: upsert_flag(
+                        flags: list.append(state.flags, [
                           ValueFlag(name: flag.name, value:),
-                          state.flags,
-                        ),
+                        ]),
                       ),
                     ),
+                    hook_state,
+                    parse_hook,
                   )
               }
             }
@@ -338,7 +475,7 @@ fn handle_short_flag(
                     remaining_input,
                     flag_specs,
                     Ok(
-                      ParseState(
+                      Args(
                         ..state,
                         flags: upsert_flag(
                           ValueFlag(
@@ -349,29 +486,32 @@ fn handle_short_flag(
                         ),
                       ),
                     ),
+                    hook_state,
+                    parse_hook,
                   )
                 ToggleKind ->
                   handle_short_flag(
                     string.concat(rest_flags),
                     remaining_input,
                     flag_specs,
-                    ParseState(
+                    Args(
                       ..state,
                       flags: upsert_flag(
                         ToggleFlag(name: flag.name),
                         state.flags,
                       ),
                     ),
+                    hook_state,
+                    parse_hook,
                   )
                 CountKind ->
                   handle_short_flag(
                     string.concat(rest_flags),
                     remaining_input,
                     flag_specs,
-                    ParseState(
-                      ..state,
-                      flags: upsert_count_flag(flag, state.flags),
-                    ),
+                    Args(..state, flags: upsert_count_flag(flag, state.flags)),
+                    hook_state,
+                    parse_hook,
                   )
               }
           }
@@ -381,7 +521,8 @@ fn handle_short_flag(
 }
 
 fn upsert_flag(new_flag: Flag, flags: List(Flag)) -> List(Flag) {
-  [new_flag, ..list.filter(flags, fn(input) { input.name != new_flag.name })]
+  list.filter(flags, fn(input) { input.name != new_flag.name })
+  |> list.append([new_flag])
 }
 
 fn upsert_count_flag(flag_spec: FlagSpec, flags: List(Flag)) -> List(Flag) {
